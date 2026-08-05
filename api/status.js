@@ -6,6 +6,10 @@
  * single JSON snapshot the status page renders. It also folds in Vercel's and
  * Supabase's own public status feeds so upstream incidents show up here too.
  *
+ * Hardened: every check is wrapped, and the handler itself always responds 200
+ * with JSON — a single failing check can never turn the whole endpoint into a
+ * blank 500. If something unexpected throws, the message is returned in `error`.
+ *
  * Classification: a network error / timeout / 5xx means "down"; a slow-but-ok
  * response is "degraded"; anything else (including auth-limited 4xx, which still
  * proves the service is answering) is "operational".
@@ -34,7 +38,7 @@ async function ping(url, opts = {}) {
     else if (latencyMs > SLOW_MS) status = "degraded";
     return { status, latencyMs, detail: `HTTP ${res.status}` };
   } catch (e) {
-    return { status: "down", latencyMs: Date.now() - t0, detail: e.name === "AbortError" ? "Timed out" : "Unreachable" };
+    return { status: "down", latencyMs: Date.now() - t0, detail: e && e.name === "AbortError" ? "Timed out" : "Unreachable" };
   } finally {
     clearTimeout(timer);
   }
@@ -48,9 +52,9 @@ async function statuspage(url) {
   try {
     const res = await fetch(url, { signal: ctrl.signal });
     const json = await res.json();
-    const indicator = json?.status?.indicator || "none";
+    const indicator = (json && json.status && json.status.indicator) || "none";
     const map = { none: "operational", minor: "degraded", major: "down", critical: "down", maintenance: "maintenance" };
-    return { status: map[indicator] || "operational", latencyMs: Date.now() - t0, detail: json?.status?.description || "Operational" };
+    return { status: map[indicator] || "operational", latencyMs: Date.now() - t0, detail: (json && json.status && json.status.description) || "Operational" };
   } catch {
     // Their feed being unreachable shouldn't make OUR system look down.
     return { status: "unknown", latencyMs: Date.now() - t0, detail: "Status feed unavailable" };
@@ -60,25 +64,40 @@ async function statuspage(url) {
 }
 
 const CHECKS = [
-  { id: "web",      name: "Web App",              group: "Newly",    run: () => ping("https://newly.gg", { method: "GET" }) },
-  { id: "database", name: "Database",             group: "Newly",    run: () => ping(`${SUPABASE_URL}/rest/v1/`, { headers: SB_HEADERS }) },
-  { id: "auth",     name: "Authentication",       group: "Newly",    run: () => ping(`${SUPABASE_URL}/auth/v1/health`, { headers: SB_HEADERS }) },
-  { id: "storage",  name: "Asset Storage",        group: "Newly",    run: () => ping(`${SUPABASE_URL}/storage/v1/bucket`, { headers: SB_HEADERS }) },
-  { id: "realtime", name: "Realtime · Team Create", group: "Newly",  run: () => ping(`${SUPABASE_URL}/realtime/v1/`, { headers: SB_HEADERS }) },
-  { id: "vercel",   name: "Vercel (hosting)",     group: "Upstream", run: () => statuspage("https://www.vercel-status.com/api/v2/status.json") },
-  { id: "supabase", name: "Supabase (backend)",   group: "Upstream", run: () => statuspage("https://status.supabase.com/api/v2/status.json") },
+  { id: "web",      name: "Web App",                group: "Newly",    run: () => ping("https://newly.gg", { method: "GET" }) },
+  { id: "database", name: "Database",               group: "Newly",    run: () => ping(`${SUPABASE_URL}/rest/v1/`, { headers: SB_HEADERS }) },
+  { id: "auth",     name: "Authentication",         group: "Newly",    run: () => ping(`${SUPABASE_URL}/auth/v1/health`, { headers: SB_HEADERS }) },
+  { id: "storage",  name: "Asset Storage",          group: "Newly",    run: () => ping(`${SUPABASE_URL}/storage/v1/bucket`, { headers: SB_HEADERS }) },
+  { id: "realtime", name: "Realtime · Team Create", group: "Newly",    run: () => ping(`${SUPABASE_URL}/realtime/v1/`, { headers: SB_HEADERS }) },
+  { id: "vercel",   name: "Vercel (hosting)",       group: "Upstream", run: () => statuspage("https://www.vercel-status.com/api/v2/status.json") },
+  { id: "supabase", name: "Supabase (backend)",     group: "Upstream", run: () => statuspage("https://status.supabase.com/api/v2/status.json") },
 ];
 
 module.exports = async (req, res) => {
-  const results = await Promise.all(CHECKS.map(async (c) => {
-    const r = await c.run();
-    return { id: c.id, name: c.name, group: c.group, ...r };
-  }));
+  try {
+    const results = await Promise.all(CHECKS.map(async (c) => {
+      try {
+        const r = await c.run();
+        return { id: c.id, name: c.name, group: c.group, ...r };
+      } catch (e) {
+        // One bad check must never take down the whole response.
+        return { id: c.id, name: c.name, group: c.group, status: "down", latencyMs: 0, detail: "Check error" };
+      }
+    }));
 
-  const worst = results.reduce((acc, c) => Math.max(acc, RANK[c.status] ?? 0), 0);
-  const overall = worst >= 3 ? "down" : worst === 2 ? "degraded" : worst === 1 ? "maintenance" : "operational";
+    const worst = results.reduce((acc, c) => Math.max(acc, RANK[c.status] != null ? RANK[c.status] : 0), 0);
+    const overall = worst >= 3 ? "down" : worst === 2 ? "degraded" : worst === 1 ? "maintenance" : "operational";
 
-  res.setHeader("Cache-Control", "public, s-maxage=15, stale-while-revalidate=45");
-  res.setHeader("Content-Type", "application/json");
-  res.status(200).json({ updatedAt: new Date().toISOString(), overall, components: results });
+    res.setHeader("Cache-Control", "public, s-maxage=15, stale-while-revalidate=45");
+    res.setHeader("Content-Type", "application/json");
+    res.status(200).json({ updatedAt: new Date().toISOString(), overall, components: results });
+  } catch (e) {
+    // Absolute last resort — still valid JSON so the page shows *something*.
+    res.status(200).json({
+      updatedAt: new Date().toISOString(),
+      overall: "down",
+      components: [],
+      error: String((e && e.message) || e),
+    });
+  }
 };
