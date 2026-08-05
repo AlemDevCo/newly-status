@@ -21,6 +21,9 @@ const SUPABASE_ANON = process.env.SUPABASE_ANON_KEY ||
   "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVrZ3p3aGJyZ25vbHRiYmVxemNmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODAzOTY0NjksImV4cCI6MjA5NTk3MjQ2OX0.AhhTdsiVHMWkeuorNoLrQcfpQuY9MPuMh3fGr3IRT5k";
 
 const SB_HEADERS = { apikey: SUPABASE_ANON, Authorization: `Bearer ${SUPABASE_ANON}` };
+
+// Cloudflare Worker that fronts R2 for asset upload/serve (see cloudSync.js).
+const R2_WORKER_URL = process.env.R2_WORKER_URL || "https://webforge-assets.aleck-masse.workers.dev";
 const SLOW_MS = 1200;       // above this a 200 is "degraded"
 const TIMEOUT_MS = 6000;
 
@@ -67,13 +70,14 @@ const CHECKS = [
   { id: "web",      name: "Web App",                group: "Newly",    run: () => ping("https://newly.gg", { method: "GET" }) },
   { id: "database", name: "Database",               group: "Newly",    run: () => ping(`${SUPABASE_URL}/rest/v1/`, { headers: SB_HEADERS }) },
   { id: "auth",     name: "Authentication",         group: "Newly",    run: () => ping(`${SUPABASE_URL}/auth/v1/health`, { headers: SB_HEADERS }) },
-  { id: "storage",  name: "Asset Storage",          group: "Newly",    run: () => ping(`${SUPABASE_URL}/storage/v1/bucket`, { headers: SB_HEADERS }) },
+  { id: "storage",  name: "Asset Storage (R2)",     group: "Newly",    run: () => ping(R2_WORKER_URL, { method: "GET" }) },
   { id: "realtime", name: "Realtime · Team Create", group: "Newly",    run: () => ping(`${SUPABASE_URL}/realtime/v1/`, { headers: SB_HEADERS }) },
   { id: "vercel",   name: "Vercel (hosting)",       group: "Upstream", run: () => statuspage("https://www.vercel-status.com/api/v2/status.json") },
   { id: "supabase", name: "Supabase (backend)",     group: "Upstream", run: () => statuspage("https://status.supabase.com/api/v2/status.json") },
+  { id: "cloudflare", name: "Cloudflare (R2 · Workers)", group: "Upstream", run: () => statuspage("https://www.cloudflarestatus.com/api/v2/status.json") },
 ];
 
-module.exports = async (req, res) => {
+export default async function handler(req, res) {
   try {
     const results = await Promise.all(CHECKS.map(async (c) => {
       try {
@@ -100,4 +104,4 @@ module.exports = async (req, res) => {
       error: String((e && e.message) || e),
     });
   }
-};
+}
